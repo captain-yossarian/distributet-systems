@@ -1,0 +1,16 @@
+[package]
+name = "master"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "master"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+tracing-subscriber = "0.3"
+redis = { version = "0.27", features = ["tokio-comp"] }
