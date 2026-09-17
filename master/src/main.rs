@@ -4,12 +4,15 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+
+mod redis_connection;
+
+use redis_connection::RedisConnection;
 
 #[derive(Clone)]
 struct AppState {
-    redis: redis::aio::MultiplexedConnection,
+    redis: RedisConnection,
 }
 
 #[tokio::main]
@@ -17,14 +20,9 @@ async fn main() {
     // initialize tracing
     tracing_subscriber::fmt::init();
 
-    let redis_url =
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let redis_client = redis::Client::open(redis_url).expect("invalid REDIS_URL");
-    let redis_conn = redis_client
-        .get_multiplexed_async_connection()
-        .await
-        .expect("failed to connect to redis");
-    let state = AppState { redis: redis_conn };
+    let state = AppState {
+        redis: redis_connection::connect_redis().await,
+    };
 
     // build our application with a route
     let app = Router::new()
@@ -52,11 +50,7 @@ async fn post_message(
     // as JSON into a `CreateMessage` type
     Json(payload): Json<CreateMessage>,
 ) -> (StatusCode, Json<Message>) {
-    let _: () = state
-        .redis
-        .rpush("messages", &payload.message)
-        .await
-        .expect("failed to store message in redis");
+    redis_connection::store_message(&mut state.redis, &payload.message).await;
 
     let message = Message {
         message: payload.message,
