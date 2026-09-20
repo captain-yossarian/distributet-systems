@@ -39,15 +39,23 @@ pub async fn get_master_messages(conn: &mut RedisConnection) -> Vec<MasterLogEnt
         .collect()
 }
 
+/// Secondaries store their received messages in a hash keyed by timestamp
+/// (RFC3339, so lexical order == chronological order) rather than an
+/// append-only list, so that both the live `/receive` path and their
+/// periodic catch-up sync can write idempotently without ever duplicating
+/// an entry.
 pub async fn get_secondary_messages(conn: &mut RedisConnection, id: &str) -> Vec<LoggedMessage> {
     let key = format!("messages:secondary:{id}");
-    let raw: Vec<String> = conn
-        .lrange(key, 0, -1)
+    let map: std::collections::HashMap<String, String> = conn
+        .hgetall(key)
         .await
         .expect("failed to read messages from redis");
-    raw.iter()
-        .filter_map(|entry| serde_json::from_str(entry).ok())
-        .collect()
+    let mut entries: Vec<LoggedMessage> = map
+        .into_iter()
+        .map(|(timestamp, message)| LoggedMessage { message, timestamp })
+        .collect();
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries
 }
 
 /// Registers (or refreshes) a secondary. Registry entries expire after

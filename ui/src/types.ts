@@ -1,6 +1,11 @@
-export interface SecondaryInfo {
+/** A secondary as shown to the UI: Docker's view (does it exist, is it
+ * running) merged with the live registry's view (its reachable address,
+ * only present while running and heartbeating). A stopped secondary still
+ * appears with `running: false` and `address: null`. */
+export interface SecondaryNode {
   id: string
-  address: string
+  address: string | null
+  running: boolean
 }
 
 export interface LoggedMessage {
@@ -36,5 +41,12 @@ export interface LogsResponse {
 export interface SecondarySettings {
   name: string
   delay_ms: number
-  failing: boolean
+}
+
+export interface ContainerInfo {
+  id: string
+  name: string
+  image: string
+  state: string
+  status: string
 }

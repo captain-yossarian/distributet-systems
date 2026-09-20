@@ -9,8 +9,14 @@ services:
     command: ["master"]
     environment:
       REDIS_URL: redis://redis:6379
+      SELF_URL: http://master:3000
     ports:
       - "3000:3000"
+    volumes:
+      # gives master access to the docker socket so it can launch new
+      # secondary containers on demand (from the UI's "Add secondary"
+      # button) — note this is effectively root on the host.
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - redis
 
@@ -21,6 +27,8 @@ services:
       REDIS_URL: redis://redis:6379
       MASTER_URL: http://master:3000
       PORT: 4000
+    labels:
+      app.role: secondary
     depends_on:
       - redis
       - master

@@ -6,12 +6,13 @@ use axum::{
 };
 use chrono::Utc;
 use common::{
-    BroadcastResult, CreateMessage, LoggedMessage, LogsResponse, MasterLogEntry, SecondaryInfo,
-    SecondaryLog, SecondarySettings,
+    BroadcastResult, ContainerInfo, CreateMessage, LoggedMessage, LogsResponse, MasterLogEntry,
+    SecondaryInfo, SecondaryLog, SecondaryNode, SecondarySettings,
 };
-use futures::future::join_all;
+use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 
+mod docker;
 mod redis_connection;
 
 use redis_connection::RedisConnection;
@@ -20,6 +21,7 @@ use redis_connection::RedisConnection;
 struct AppState {
     redis: RedisConnection,
     http: reqwest::Client,
+    docker: bollard::Docker,
 }
 
 #[tokio::main]
@@ -30,6 +32,7 @@ async fn main() {
     let state = AppState {
         redis: redis_connection::connect_redis().await,
         http: reqwest::Client::new(),
+        docker: docker::connect().await,
     };
 
     // build our application with a route
@@ -42,13 +45,22 @@ async fn main() {
         .route("/secondaries/register", post(register_secondary))
         // `GET /secondaries` lists the currently alive secondaries
         .route("/secondaries", get(list_secondaries))
-        // read/update one secondary's test settings (delay, simulated failure)
+        // launches a new secondary container via the docker socket
+        .route("/secondaries/spawn", post(spawn_secondary))
+        // real docker stop/start of one secondary's container
+        .route("/secondaries/:id/stop", post(stop_secondary))
+        .route("/secondaries/:id/start", post(start_secondary))
+        // read/update one secondary's test settings (name, delay)
         .route(
             "/secondaries/:id/settings",
             get(get_secondary_settings).post(update_secondary_settings),
         )
         // `GET /logs` returns master + every secondary's message history
         .route("/logs", get(get_logs))
+        // canonical broadcast history, pulled by secondaries for catch-up sync
+        .route("/messages", get(get_all_messages))
+        // `GET /docker/ps` lists currently-running containers on the host
+        .route("/docker/ps", get(docker_ps))
         .with_state(state)
         .layer(CorsLayer::permissive());
 
@@ -72,8 +84,69 @@ async fn register_secondary(
     StatusCode::OK
 }
 
-async fn list_secondaries(State(mut state): State<AppState>) -> Json<Vec<SecondaryInfo>> {
-    Json(redis_connection::list_secondaries(&mut state.redis).await)
+/// The secondaries the UI should know about: every container Docker has
+/// labeled as a secondary (running or stopped), with a reachable address
+/// filled in from the live registry wherever one is currently registered.
+/// A stopped container has no address (nothing to reach), but it still
+/// appears — that's what makes `/secondaries/:id/start` discoverable.
+async fn list_secondary_nodes(state: &mut AppState) -> Vec<SecondaryNode> {
+    let containers = docker::list_secondary_containers(&state.docker)
+        .await
+        .unwrap_or_default();
+    let registered = redis_connection::list_secondaries(&mut state.redis).await;
+    let addresses: std::collections::HashMap<String, String> = registered
+        .into_iter()
+        .map(|secondary| (secondary.id, secondary.address))
+        .collect();
+
+    containers
+        .into_iter()
+        .map(|(id, running)| {
+            let address = addresses.get(&id).cloned();
+            SecondaryNode {
+                address,
+                running,
+                id,
+            }
+        })
+        .collect()
+}
+
+async fn list_secondaries(State(mut state): State<AppState>) -> Json<Vec<SecondaryNode>> {
+    Json(list_secondary_nodes(&mut state).await)
+}
+
+async fn spawn_secondary(State(state): State<AppState>) -> StatusCode {
+    match docker::spawn_secondary(&state.docker).await {
+        Ok(id) => {
+            tracing::info!("spawned new secondary container {id}");
+            StatusCode::CREATED
+        }
+        Err(err) => {
+            tracing::error!("failed to spawn secondary container: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn stop_secondary(State(state): State<AppState>, Path(id): Path<String>) -> StatusCode {
+    match docker::stop_container(&state.docker, &id).await {
+        Ok(()) => StatusCode::OK,
+        Err(err) => {
+            tracing::error!("failed to stop container {id}: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn start_secondary(State(state): State<AppState>, Path(id): Path<String>) -> StatusCode {
+    match docker::start_container(&state.docker, &id).await {
+        Ok(()) => StatusCode::OK,
+        Err(err) => {
+            tracing::error!("failed to start container {id}: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 async fn find_secondary(state: &mut AppState, id: &str) -> Result<SecondaryInfo, StatusCode> {
@@ -136,39 +209,50 @@ async fn post_message(
         timestamp: timestamp.clone(),
     };
 
-    // broadcast the message to every currently registered secondary
-    // concurrently, but this handler does not return a response until every
-    // one of them has ACKed (or failed) — blocking replication: the caller
-    // only sees the request as finished once the full fan-out has settled.
+    // Broadcast to every currently registered secondary as an independent,
+    // detached task (tokio::spawn) so each one always runs to completion —
+    // and therefore still logs the message on its end — even if this
+    // handler stops waiting before it finishes. Write concern: `w` counts
+    // master's own (always-satisfied) write as 1, so the number of
+    // secondary ACKs actually waited on is `w - 1`.
     let secondaries = redis_connection::list_secondaries(&mut state.redis).await;
-    let acks = join_all(secondaries.iter().map(|secondary| {
+    let total = secondaries.len();
+    let w = payload.write_concern.unwrap_or(1).clamp(1, 1 + total);
+    let target = w - 1;
+
+    let (tx, mut rx) = mpsc::channel::<(String, bool)>(total.max(1));
+    for secondary in &secondaries {
         let url = format!("{}/receive", secondary.address);
         let client = state.http.clone();
-        let entry = &wire_entry;
-        async move {
+        let entry = wire_entry.clone();
+        let id = secondary.id.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
             let acked = matches!(
-                client.post(&url).json(entry).send().await,
+                client.post(&url).json(&entry).send().await,
                 Ok(resp) if resp.status().is_success()
             );
-            (secondary.id.clone(), acked)
-        }
-    }))
-    .await;
+            let _ = tx.send((id, acked)).await;
+        });
+    }
+    drop(tx);
 
     let mut delivered = Vec::new();
     let mut failed = Vec::new();
-    for (id, acked) in acks {
-        if acked {
-            delivered.push(id);
-        } else {
-            failed.push(id);
+    while delivered.len() < target {
+        match rx.recv().await {
+            Some((id, true)) => delivered.push(id),
+            Some((id, false)) => failed.push(id),
+            // every task has reported in — `target` was never reachable
+            // (too many failures), nothing more to wait for
+            None => break,
         }
     }
 
     let log_entry = MasterLogEntry {
         message: payload.message.clone(),
         timestamp: timestamp.clone(),
-        sent: secondaries.len(),
+        sent: total,
         acked: delivered.len(),
     };
     redis_connection::log_master_message(&mut state.redis, &log_entry).await;
@@ -185,16 +269,43 @@ async fn post_message(
     (StatusCode::CREATED, Json(result))
 }
 
+async fn docker_ps(State(state): State<AppState>) -> Result<Json<Vec<ContainerInfo>>, StatusCode> {
+    docker::list_containers(&state.docker)
+        .await
+        .map(Json)
+        .map_err(|err| {
+            tracing::error!("failed to list containers: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// The full canonical history of broadcast messages, in order. Secondaries
+/// poll this to catch up on anything they missed (while simulated down, or
+/// after a real restart) that live `/receive` calls never redelivered.
+async fn get_all_messages(State(mut state): State<AppState>) -> Json<Vec<LoggedMessage>> {
+    let master = redis_connection::get_master_messages(&mut state.redis).await;
+    Json(
+        master
+            .into_iter()
+            .map(|entry| LoggedMessage {
+                message: entry.message,
+                timestamp: entry.timestamp,
+            })
+            .collect(),
+    )
+}
+
 async fn get_logs(State(mut state): State<AppState>) -> Json<LogsResponse> {
     let master = redis_connection::get_master_messages(&mut state.redis).await;
 
-    let secondaries = redis_connection::list_secondaries(&mut state.redis).await;
+    // includes stopped secondaries too, so a container's history doesn't
+    // vanish from the UI just because it's currently powered off
+    let nodes = list_secondary_nodes(&mut state).await;
     let mut secondary_logs = Vec::new();
-    for secondary in &secondaries {
-        let messages =
-            redis_connection::get_secondary_messages(&mut state.redis, &secondary.id).await;
+    for node in &nodes {
+        let messages = redis_connection::get_secondary_messages(&mut state.redis, &node.id).await;
         secondary_logs.push(SecondaryLog {
-            id: secondary.id.clone(),
+            id: node.id.clone(),
             messages,
         });
     }

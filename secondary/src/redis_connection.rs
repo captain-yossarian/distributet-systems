@@ -1,7 +1,13 @@
+use std::collections::HashSet;
+
 use common::LoggedMessage;
 use redis::AsyncCommands;
 
 pub type RedisConnection = redis::aio::MultiplexedConnection;
+
+fn key_for(id: &str) -> String {
+    format!("messages:secondary:{id}")
+}
 
 pub async fn connect_redis() -> RedisConnection {
     let redis_url =
@@ -13,11 +19,24 @@ pub async fn connect_redis() -> RedisConnection {
         .expect("failed to connect to redis")
 }
 
+/// Stores a received message keyed by its (master-assigned, RFC3339, thus
+/// lexically sortable) timestamp. Writing the same timestamp twice is a
+/// no-op, which makes this safe to call from both the live `/receive` path
+/// and the periodic catch-up sync (see `sync_loop` in main.rs) without ever
+/// producing duplicate entries.
 pub async fn log_message(conn: &mut RedisConnection, id: &str, entry: &LoggedMessage) {
-    let key = format!("messages:secondary:{id}");
-    let payload = serde_json::to_string(entry).expect("failed to serialize message");
     let _: () = conn
-        .rpush(key, payload)
+        .hset(key_for(id), &entry.timestamp, &entry.message)
         .await
         .expect("failed to store message in redis");
+}
+
+/// Timestamps of messages this secondary already has, used by the catch-up
+/// sync to figure out what it's missing from master's full history.
+pub async fn known_timestamps(conn: &mut RedisConnection, id: &str) -> HashSet<String> {
+    let map: std::collections::HashMap<String, String> = conn
+        .hgetall(key_for(id))
+        .await
+        .expect("failed to read known messages from redis");
+    map.into_keys().collect()
 }

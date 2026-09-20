@@ -1,5 +1,5 @@
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -18,7 +18,6 @@ use redis_connection::RedisConnection;
 struct Settings {
     name: RwLock<String>,
     delay_ms: AtomicU64,
-    failing: AtomicBool,
 }
 
 impl Settings {
@@ -26,14 +25,12 @@ impl Settings {
         SecondarySettings {
             name: self.name.read().unwrap().clone(),
             delay_ms: self.delay_ms.load(Ordering::Relaxed),
-            failing: self.failing.load(Ordering::Relaxed),
         }
     }
 
     fn apply(&self, next: SecondarySettings) {
         *self.name.write().unwrap() = next.name;
         self.delay_ms.store(next.delay_ms, Ordering::Relaxed);
-        self.failing.store(next.failing, Ordering::Relaxed);
     }
 }
 
@@ -58,13 +55,15 @@ async fn main() {
         std::env::var("MASTER_URL").unwrap_or_else(|_| "http://master:3000".to_string());
     let address = format!("http://{}:{port}", local_ip());
 
+    let redis = redis_connection::connect_redis().await;
+    let sync_redis = redis.clone();
+
     let state = AppState {
-        redis: redis_connection::connect_redis().await,
+        redis,
         id: id.clone(),
         settings: Arc::new(Settings {
             name: RwLock::new(String::new()),
             delay_ms: AtomicU64::new(0),
-            failing: AtomicBool::new(false),
         }),
     };
 
@@ -73,7 +72,8 @@ async fn main() {
         .route("/settings", get(get_settings).post(update_settings))
         .with_state(state);
 
-    tokio::spawn(register_loop(master_url, id.clone(), address));
+    tokio::spawn(register_loop(master_url.clone(), id.clone(), address));
+    tokio::spawn(sync_loop(master_url, id.clone(), sync_redis));
 
     tracing::info!("secondary {id} listening on port {port}");
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
@@ -86,18 +86,9 @@ async fn receive_message(
     State(mut state): State<AppState>,
     Json(entry): Json<LoggedMessage>,
 ) -> StatusCode {
-    if state.settings.failing.load(Ordering::Relaxed) {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    }
-
     let delay_ms = state.settings.delay_ms.load(Ordering::Relaxed);
     if delay_ms > 0 {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-    }
-
-    // settings may have changed while we were sleeping
-    if state.settings.failing.load(Ordering::Relaxed) {
-        return StatusCode::SERVICE_UNAVAILABLE;
     }
 
     redis_connection::log_message(&mut state.redis, &state.id, &entry).await;
@@ -125,6 +116,35 @@ async fn register_loop(master_url: String, id: String, address: String) {
     loop {
         if let Err(err) = client.post(&url).json(&info).send().await {
             tracing::warn!("failed to register with master: {err}");
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Periodically pulls master's full message history and backfills anything
+/// missing from this secondary's own log. This is what lets a secondary
+/// catch up on messages it missed while it was actually stopped (there's
+/// nothing to guard here for that case — a stopped container simply isn't
+/// running this loop either, so there's no risk of it backfilling while
+/// "down"). `redis_connection::log_message` is idempotent per timestamp, so
+/// replaying already-known entries is harmless.
+async fn sync_loop(master_url: String, id: String, mut redis: RedisConnection) {
+    let client = reqwest::Client::new();
+    let url = format!("{master_url}/messages");
+    loop {
+        match client.get(&url).send().await {
+            Ok(resp) => match resp.json::<Vec<LoggedMessage>>().await {
+                Ok(all) => {
+                    let known = redis_connection::known_timestamps(&mut redis, &id).await;
+                    for entry in all {
+                        if !known.contains(&entry.timestamp) {
+                            redis_connection::log_message(&mut redis, &id, &entry).await;
+                        }
+                    }
+                }
+                Err(err) => tracing::warn!("failed to parse master's message history: {err}"),
+            },
+            Err(err) => tracing::warn!("failed to fetch master's message history: {err}"),
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
