@@ -40,6 +40,7 @@ function SecondaryCard({
   onUpdateSettings,
   onStop,
   onStart,
+  onUnregister,
 }: {
   secondary: SecondaryNode
   messages: LogsResponse['secondaries'][number]['messages']
@@ -47,6 +48,7 @@ function SecondaryCard({
   onUpdateSettings: (id: string, next: SecondarySettings) => Promise<void>
   onStop: (id: string) => Promise<void>
   onStart: (id: string) => Promise<void>
+  onUnregister: (id: string) => Promise<void>
 }) {
   const last = messages[messages.length - 1]
   const down = !secondary.running
@@ -111,6 +113,7 @@ function SecondaryCard({
             running={secondary.running}
             onStop={() => onStop(secondary.id)}
             onStart={() => onStart(secondary.id)}
+            onUnregister={() => onUnregister(secondary.id)}
           />
         </div>
       )}
@@ -125,6 +128,7 @@ export default function TopologyPanel({
   onUpdateSettings,
   onStop,
   onStart,
+  onUnregister,
 }: {
   secondaries: SecondaryNode[]
   logs: LogsResponse
@@ -132,6 +136,7 @@ export default function TopologyPanel({
   onUpdateSettings: (id: string, next: SecondarySettings) => Promise<void>
   onStop: (id: string) => Promise<void>
   onStart: (id: string) => Promise<void>
+  onUnregister: (id: string) => Promise<void>
 }) {
   return (
     <section className="panel">
@@ -155,6 +160,7 @@ export default function TopologyPanel({
               onUpdateSettings={onUpdateSettings}
               onStop={onStop}
               onStart={onStart}
+              onUnregister={onUnregister}
             />
           ))}
         </div>

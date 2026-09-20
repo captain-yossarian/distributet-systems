@@ -55,10 +55,22 @@ pub struct BroadcastResult {
     pub failed: Vec<String>,
 }
 
+/// One retry attempt master made trying to deliver a message to a
+/// secondary that didn't respond successfully. `attempt` counts the retry
+/// itself (1st retry, 2nd retry, ...), not the original attempt.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RetryEntry {
+    pub message: String,
+    pub timestamp: String,
+    pub attempt: u32,
+    pub max_attempts: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SecondaryLog {
     pub id: String,
     pub messages: Vec<LoggedMessage>,
+    pub retries: Vec<RetryEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]

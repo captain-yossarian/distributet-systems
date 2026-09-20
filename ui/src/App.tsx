@@ -8,6 +8,7 @@ import {
   spawnSecondary,
   startSecondary,
   stopSecondary,
+  unregisterSecondary,
   updateSecondarySettings,
 } from './api'
 import ContainersPanel from './ContainersPanel'
@@ -106,6 +107,16 @@ export default function App() {
     await refresh()
   }
 
+  const handleUnregister = async (id: string) => {
+    await unregisterSecondary(id)
+    setSecondarySettings((prev) => {
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+    await refresh()
+  }
+
   return (
     <main className="app">
       <Header
@@ -124,6 +135,7 @@ export default function App() {
             onUpdateSettings={handleUpdateSettings}
             onStop={handleStop}
             onStart={handleStart}
+            onUnregister={handleUnregister}
           />
           <SendMessagePanel
             onSend={handleSend}

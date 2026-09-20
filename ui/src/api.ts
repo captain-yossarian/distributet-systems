@@ -35,6 +35,14 @@ export function startSecondary(id: string): Promise<void> {
   })
 }
 
+export function unregisterSecondary(id: string): Promise<void> {
+  return fetch(`${MASTER_URL}/secondaries/${encodeURIComponent(id)}/unregister`, {
+    method: 'POST',
+  }).then((res) => {
+    if (!res.ok) throw new Error(`request failed: ${res.status}`)
+  })
+}
+
 export function fetchLogs(): Promise<LogsResponse> {
   return fetch(`${MASTER_URL}/logs`).then((res) => json<LogsResponse>(res))
 }

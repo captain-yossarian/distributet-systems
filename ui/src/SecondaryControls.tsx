@@ -7,17 +7,20 @@ export default function SecondaryControls({
   running,
   onStop,
   onStart,
+  onUnregister,
 }: {
   settings: SecondarySettings | null
   onChangeSettings: (next: SecondarySettings) => Promise<void>
   running: boolean
   onStop: () => Promise<void>
   onStart: () => Promise<void>
+  onUnregister: () => Promise<void>
 }) {
   const [nameInput, setNameInput] = useState('')
   const [delayInput, setDelayInput] = useState('0')
   const [savingSettings, setSavingSettings] = useState(false)
   const [powerBusy, setPowerBusy] = useState(false)
+  const [unregistering, setUnregistering] = useState(false)
 
   // Hydrate the inputs from the server exactly once, the first time real
   // settings arrive. The app polls every few seconds, which would otherwise
@@ -51,6 +54,18 @@ export default function SecondaryControls({
       await (running ? onStop() : onStart())
     } finally {
       setPowerBusy(false)
+    }
+  }
+
+  const handleUnregister = async () => {
+    if (!window.confirm('Unregister this secondary? It will disappear from the list — it can only come back by registering itself again.')) {
+      return
+    }
+    setUnregistering(true)
+    try {
+      await onUnregister()
+    } finally {
+      setUnregistering(false)
     }
   }
 
@@ -106,6 +121,16 @@ export default function SecondaryControls({
             ? 'Stop server'
             : 'Start server'}
       </button>
+      {!running && (
+        <button
+          type="button"
+          className="unregister-button"
+          disabled={unregistering}
+          onClick={handleUnregister}
+        >
+          {unregistering ? 'Unregistering…' : 'Unregister'}
+        </button>
+      )}
     </div>
   )
 }

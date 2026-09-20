@@ -27,9 +27,20 @@ export interface MasterLogEntry {
   acked: number
 }
 
+/** One retry attempt master made trying to deliver a message to this
+ * secondary. `attempt` counts the retry itself (1st retry, 2nd retry, ...),
+ * not the original attempt. */
+export interface RetryEntry {
+  message: string
+  timestamp: string
+  attempt: number
+  max_attempts: number
+}
+
 export interface SecondaryLog {
   id: string
   messages: LoggedMessage[]
+  retries: RetryEntry[]
 }
 
 export interface LogsResponse {

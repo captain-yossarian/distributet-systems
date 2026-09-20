@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -7,10 +9,16 @@ use axum::{
 use chrono::Utc;
 use common::{
     BroadcastResult, ContainerInfo, CreateMessage, LoggedMessage, LogsResponse, MasterLogEntry,
-    SecondaryInfo, SecondaryLog, SecondaryNode, SecondarySettings,
+    RetryEntry, SecondaryInfo, SecondaryLog, SecondaryNode, SecondarySettings,
 };
 use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
+
+/// Delivery retry policy for `POST /receive`: if a secondary doesn't
+/// respond successfully, retry this many more times, waiting this long
+/// between each attempt, before finally counting it as failed.
+const MAX_DELIVERY_RETRIES: u32 = 3;
+const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 mod docker;
 mod redis_connection;
@@ -31,7 +39,17 @@ async fn main() {
 
     let state = AppState {
         redis: redis_connection::connect_redis().await,
-        http: reqwest::Client::new(),
+        // Without an explicit timeout, a secondary that's genuinely
+        // unreachable (its container stopped, its network endpoint gone)
+        // doesn't fail fast with "connection refused" — the connect
+        // attempt can hang on OS-level TCP retransmission for a long time
+        // (observed: over a minute), which would make the retry policy's
+        // 10s interval meaningless. Capped well under that interval so
+        // each attempt fails predictably before the next retry is due.
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .expect("failed to build http client"),
         docker: docker::connect().await,
     };
 
@@ -50,6 +68,9 @@ async fn main() {
         // real docker stop/start of one secondary's container
         .route("/secondaries/:id/stop", post(stop_secondary))
         .route("/secondaries/:id/start", post(start_secondary))
+        // user-initiated removal from the known-secondaries list — the
+        // only thing that ever takes a secondary off it now
+        .route("/secondaries/:id/unregister", post(unregister_secondary))
         // read/update one secondary's test settings (name, delay)
         .route(
             "/secondaries/:id/settings",
@@ -84,32 +105,39 @@ async fn register_secondary(
     StatusCode::OK
 }
 
-/// The secondaries the UI should know about: every container Docker has
-/// labeled as a secondary (running or stopped), with a reachable address
-/// filled in from the live registry wherever one is currently registered.
-/// A stopped container has no address (nothing to reach), but it still
-/// appears — that's what makes `/secondaries/:id/start` discoverable.
+/// The secondaries the UI should know about: every secondary that has ever
+/// registered, still present regardless of what Docker currently thinks of
+/// its container (stopped, or even removed outright) — only an explicit
+/// `/secondaries/:id/unregister` call takes one off this list. Docker is
+/// consulted only to say whether it's *currently running*.
 async fn list_secondary_nodes(state: &mut AppState) -> Vec<SecondaryNode> {
     let containers = docker::list_secondary_containers(&state.docker)
         .await
         .unwrap_or_default();
-    let registered = redis_connection::list_secondaries(&mut state.redis).await;
-    let addresses: std::collections::HashMap<String, String> = registered
+    let running_ids: std::collections::HashSet<String> = containers
         .into_iter()
-        .map(|secondary| (secondary.id, secondary.address))
+        .filter(|(_, running)| *running)
+        .map(|(id, _)| id)
         .collect();
 
-    containers
+    redis_connection::list_known_secondaries(&mut state.redis)
+        .await
         .into_iter()
-        .map(|(id, running)| {
-            let address = addresses.get(&id).cloned();
-            SecondaryNode {
-                address,
-                running,
-                id,
-            }
+        .map(|secondary| SecondaryNode {
+            running: running_ids.contains(&secondary.id),
+            address: Some(secondary.address),
+            id: secondary.id,
         })
         .collect()
+}
+
+/// The secondaries a message broadcast should target: every *known*
+/// secondary with a recorded address, regardless of whether it's
+/// currently heartbeating. Stopping a secondary must not remove it from
+/// this list — delivery to it should fail (and retry, and get logged),
+/// not silently skip it.
+async fn list_broadcast_targets(state: &mut AppState) -> Vec<SecondaryInfo> {
+    redis_connection::list_known_secondaries(&mut state.redis).await
 }
 
 async fn list_secondaries(State(mut state): State<AppState>) -> Json<Vec<SecondaryNode>> {
@@ -145,6 +173,25 @@ async fn start_secondary(State(state): State<AppState>, Path(id): Path<String>) 
         Err(err) => {
             tracing::error!("failed to start container {id}: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// Removes a secondary from the known list entirely. Only allowed while
+/// it's stopped — unregistering a still-running one would be pointless
+/// (its own heartbeat would just re-register it within a few seconds) —
+/// so this is checked server-side too, not just hidden client-side.
+async fn unregister_secondary(
+    State(mut state): State<AppState>,
+    Path(id): Path<String>,
+) -> StatusCode {
+    let nodes = list_secondary_nodes(&mut state).await;
+    match nodes.into_iter().find(|node| node.id == id) {
+        Some(node) if node.running => StatusCode::CONFLICT,
+        _ => {
+            redis_connection::forget_secondary(&mut state.redis, &id).await;
+            tracing::info!("unregistered secondary {id}");
+            StatusCode::OK
         }
     }
 }
@@ -209,13 +256,15 @@ async fn post_message(
         timestamp: timestamp.clone(),
     };
 
-    // Broadcast to every currently registered secondary as an independent,
-    // detached task (tokio::spawn) so each one always runs to completion —
-    // and therefore still logs the message on its end — even if this
-    // handler stops waiting before it finishes. Write concern: `w` counts
-    // master's own (always-satisfied) write as 1, so the number of
-    // secondary ACKs actually waited on is `w - 1`.
-    let secondaries = redis_connection::list_secondaries(&mut state.redis).await;
+    // Broadcast to every *known* secondary (not just currently-live ones —
+    // a stopped secondary must still be attempted, so it correctly shows
+    // up as a failure/retry rather than silently dropping out of `total`)
+    // as an independent, detached task (tokio::spawn) so each one always
+    // runs to completion — and therefore still logs the message on its
+    // end — even if this handler stops waiting before it finishes. Write
+    // concern: `w` counts master's own (always-satisfied) write as 1, so
+    // the number of secondary ACKs actually waited on is `w - 1`.
+    let secondaries = list_broadcast_targets(&mut state).await;
     let total = secondaries.len();
     let w = payload.write_concern.unwrap_or(1).clamp(1, 1 + total);
     let target = w - 1;
@@ -227,11 +276,36 @@ async fn post_message(
         let entry = wire_entry.clone();
         let id = secondary.id.clone();
         let tx = tx.clone();
+        let mut redis = state.redis.clone();
         tokio::spawn(async move {
-            let acked = matches!(
-                client.post(&url).json(&entry).send().await,
-                Ok(resp) if resp.status().is_success()
-            );
+            let mut acked;
+            let mut attempt = 0;
+            loop {
+                acked = matches!(
+                    client.post(&url).json(&entry).send().await,
+                    Ok(resp) if resp.status().is_success()
+                );
+                if acked || attempt >= MAX_DELIVERY_RETRIES {
+                    break;
+                }
+                attempt += 1;
+                tracing::warn!(
+                    "delivery to {id} failed, retrying ({attempt}/{MAX_DELIVERY_RETRIES}) in {}s",
+                    RETRY_INTERVAL.as_secs()
+                );
+                redis_connection::log_retry(
+                    &mut redis,
+                    &id,
+                    &RetryEntry {
+                        message: entry.message.clone(),
+                        timestamp: entry.timestamp.clone(),
+                        attempt,
+                        max_attempts: MAX_DELIVERY_RETRIES,
+                    },
+                )
+                .await;
+                tokio::time::sleep(RETRY_INTERVAL).await;
+            }
             let _ = tx.send((id, acked)).await;
         });
     }
@@ -256,6 +330,35 @@ async fn post_message(
         acked: delivered.len(),
     };
     redis_connection::log_master_message(&mut state.redis, &log_entry).await;
+
+    // The response (and the log entry above) reflect the outcome as of the
+    // moment write concern was satisfied — but a secondary still mid-retry
+    // at that moment can succeed afterward, well after this request has
+    // already returned. Keep draining stragglers in the background and
+    // correct the logged `acked` count once the true final outcome is
+    // known, instead of leaving it permanently frozen at a now-stale
+    // snapshot. `log_master_message` upserts by timestamp, so this simply
+    // overwrites the entry written above.
+    {
+        let mut acked_count = delivered.len();
+        let message = payload.message.clone();
+        let timestamp = timestamp.clone();
+        let mut redis = state.redis.clone();
+        tokio::spawn(async move {
+            while let Some((_id, acked)) = rx.recv().await {
+                if acked {
+                    acked_count += 1;
+                }
+            }
+            let corrected_entry = MasterLogEntry {
+                message,
+                timestamp,
+                sent: total,
+                acked: acked_count,
+            };
+            redis_connection::log_master_message(&mut redis, &corrected_entry).await;
+        });
+    }
 
     let result = BroadcastResult {
         message: payload.message,
@@ -304,9 +407,11 @@ async fn get_logs(State(mut state): State<AppState>) -> Json<LogsResponse> {
     let mut secondary_logs = Vec::new();
     for node in &nodes {
         let messages = redis_connection::get_secondary_messages(&mut state.redis, &node.id).await;
+        let retries = redis_connection::get_retries(&mut state.redis, &node.id).await;
         secondary_logs.push(SecondaryLog {
             id: node.id.clone(),
             messages,
+            retries,
         });
     }
 
