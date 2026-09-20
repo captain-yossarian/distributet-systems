@@ -1,6 +1,6 @@
 import AckCounter from './AckCounter'
 import { formatTimestamp } from './format'
-import type { LoggedMessage, LogsResponse, MasterLogEntry } from './types'
+import type { LoggedMessage, LogsResponse, MasterLogEntry, SecondarySettings } from './types'
 
 function MasterLogColumn({ entries }: { entries: MasterLogEntry[] }) {
   return (
@@ -40,15 +40,28 @@ function SecondaryLogColumn({ title, entries }: { title: string; entries: Logged
   )
 }
 
-export default function LogsView({ logs }: { logs: LogsResponse }) {
+export default function LogsView({
+  logs,
+  secondarySettings,
+}: {
+  logs: LogsResponse
+  secondarySettings: Record<string, SecondarySettings>
+}) {
   return (
     <section>
       <h2>Logs</h2>
       <div className="logs">
         <MasterLogColumn entries={logs.master} />
-        {logs.secondaries.map((secondary) => (
-          <SecondaryLogColumn key={secondary.id} title={secondary.id} entries={secondary.messages} />
-        ))}
+        {logs.secondaries.map((secondary) => {
+          const name = secondarySettings[secondary.id]?.name.trim()
+          return (
+            <SecondaryLogColumn
+              key={secondary.id}
+              title={name || secondary.id}
+              entries={secondary.messages}
+            />
+          )
+        })}
       </div>
     </section>
   )

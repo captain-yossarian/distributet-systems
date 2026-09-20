@@ -1,17 +1,47 @@
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
-use common::{LoggedMessage, SecondaryInfo};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+use common::{LoggedMessage, SecondaryInfo, SecondarySettings};
 
 mod redis_connection;
 
 use redis_connection::RedisConnection;
 
+struct Settings {
+    name: RwLock<String>,
+    delay_ms: AtomicU64,
+    failing: AtomicBool,
+}
+
+impl Settings {
+    fn snapshot(&self) -> SecondarySettings {
+        SecondarySettings {
+            name: self.name.read().unwrap().clone(),
+            delay_ms: self.delay_ms.load(Ordering::Relaxed),
+            failing: self.failing.load(Ordering::Relaxed),
+        }
+    }
+
+    fn apply(&self, next: SecondarySettings) {
+        *self.name.write().unwrap() = next.name;
+        self.delay_ms.store(next.delay_ms, Ordering::Relaxed);
+        self.failing.store(next.failing, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     redis: RedisConnection,
     id: String,
+    settings: Arc<Settings>,
 }
 
 #[tokio::main]
@@ -31,10 +61,16 @@ async fn main() {
     let state = AppState {
         redis: redis_connection::connect_redis().await,
         id: id.clone(),
+        settings: Arc::new(Settings {
+            name: RwLock::new(String::new()),
+            delay_ms: AtomicU64::new(0),
+            failing: AtomicBool::new(false),
+        }),
     };
 
     let app = Router::new()
         .route("/receive", post(receive_message))
+        .route("/settings", get(get_settings).post(update_settings))
         .with_state(state);
 
     tokio::spawn(register_loop(master_url, id.clone(), address));
@@ -50,8 +86,34 @@ async fn receive_message(
     State(mut state): State<AppState>,
     Json(entry): Json<LoggedMessage>,
 ) -> StatusCode {
+    if state.settings.failing.load(Ordering::Relaxed) {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
+    let delay_ms = state.settings.delay_ms.load(Ordering::Relaxed);
+    if delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+
+    // settings may have changed while we were sleeping
+    if state.settings.failing.load(Ordering::Relaxed) {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
     redis_connection::log_message(&mut state.redis, &state.id, &entry).await;
     StatusCode::OK
+}
+
+async fn get_settings(State(state): State<AppState>) -> Json<SecondarySettings> {
+    Json(state.settings.snapshot())
+}
+
+async fn update_settings(
+    State(state): State<AppState>,
+    Json(next): Json<SecondarySettings>,
+) -> Json<SecondarySettings> {
+    state.settings.apply(next);
+    Json(state.settings.snapshot())
 }
 
 /// Repeatedly (re-)registers this secondary with master so master's

@@ -1,1 +1,1 @@
-{"root":["./src/AckCounter.tsx","./src/App.tsx","./src/LogsView.tsx","./src/MessageForm.tsx","./src/Topology.tsx","./src/api.ts","./src/format.ts","./src/main.tsx","./src/types.ts","./src/vite-env.d.ts"],"version":"5.9.3"}
+{"root":["./src/AckCounter.tsx","./src/App.tsx","./src/LogsView.tsx","./src/MessageForm.tsx","./src/SecondaryControls.tsx","./src/Topology.tsx","./src/api.ts","./src/format.ts","./src/main.tsx","./src/types.ts","./src/vite-env.d.ts"],"version":"5.9.3"}

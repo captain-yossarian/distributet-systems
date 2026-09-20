@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -7,8 +7,9 @@ use axum::{
 use chrono::Utc;
 use common::{
     BroadcastResult, CreateMessage, LoggedMessage, LogsResponse, MasterLogEntry, SecondaryInfo,
-    SecondaryLog,
+    SecondaryLog, SecondarySettings,
 };
+use futures::future::join_all;
 use tower_http::cors::CorsLayer;
 
 mod redis_connection;
@@ -41,6 +42,11 @@ async fn main() {
         .route("/secondaries/register", post(register_secondary))
         // `GET /secondaries` lists the currently alive secondaries
         .route("/secondaries", get(list_secondaries))
+        // read/update one secondary's test settings (delay, simulated failure)
+        .route(
+            "/secondaries/:id/settings",
+            get(get_secondary_settings).post(update_secondary_settings),
+        )
         // `GET /logs` returns master + every secondary's message history
         .route("/logs", get(get_logs))
         .with_state(state)
@@ -70,6 +76,54 @@ async fn list_secondaries(State(mut state): State<AppState>) -> Json<Vec<Seconda
     Json(redis_connection::list_secondaries(&mut state.redis).await)
 }
 
+async fn find_secondary(state: &mut AppState, id: &str) -> Result<SecondaryInfo, StatusCode> {
+    redis_connection::list_secondaries(&mut state.redis)
+        .await
+        .into_iter()
+        .find(|secondary| secondary.id == id)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn get_secondary_settings(
+    State(mut state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SecondarySettings>, StatusCode> {
+    let secondary = find_secondary(&mut state, &id).await?;
+    let url = format!("{}/settings", secondary.address);
+    let resp = state
+        .http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let settings = resp
+        .json::<SecondarySettings>()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(settings))
+}
+
+async fn update_secondary_settings(
+    State(mut state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<SecondarySettings>,
+) -> Result<Json<SecondarySettings>, StatusCode> {
+    let secondary = find_secondary(&mut state, &id).await?;
+    let url = format!("{}/settings", secondary.address);
+    let resp = state
+        .http
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let settings = resp
+        .json::<SecondarySettings>()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(settings))
+}
+
 async fn post_message(
     State(mut state): State<AppState>,
     // this argument tells axum to parse the request body
@@ -82,17 +136,32 @@ async fn post_message(
         timestamp: timestamp.clone(),
     };
 
-    // broadcast the message to every currently registered secondary and
-    // wait for each one's ACK (a successful `/receive` response) before
-    // counting it as delivered
+    // broadcast the message to every currently registered secondary
+    // concurrently, but this handler does not return a response until every
+    // one of them has ACKed (or failed) — blocking replication: the caller
+    // only sees the request as finished once the full fan-out has settled.
     let secondaries = redis_connection::list_secondaries(&mut state.redis).await;
+    let acks = join_all(secondaries.iter().map(|secondary| {
+        let url = format!("{}/receive", secondary.address);
+        let client = state.http.clone();
+        let entry = &wire_entry;
+        async move {
+            let acked = matches!(
+                client.post(&url).json(entry).send().await,
+                Ok(resp) if resp.status().is_success()
+            );
+            (secondary.id.clone(), acked)
+        }
+    }))
+    .await;
+
     let mut delivered = Vec::new();
     let mut failed = Vec::new();
-    for secondary in &secondaries {
-        let url = format!("{}/receive", secondary.address);
-        match state.http.post(&url).json(&wire_entry).send().await {
-            Ok(resp) if resp.status().is_success() => delivered.push(secondary.id.clone()),
-            _ => failed.push(secondary.id.clone()),
+    for (id, acked) in acks {
+        if acked {
+            delivered.push(id);
+        } else {
+            failed.push(id);
         }
     }
 

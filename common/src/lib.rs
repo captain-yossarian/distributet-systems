@@ -27,6 +27,19 @@ pub struct SecondaryInfo {
     pub address: String,
 }
 
+/// User-controllable test knobs for a secondary: a display name (purely
+/// cosmetic — the registry `id` is still used for routing/keys), an
+/// artificial delay before it ACKs a received message, and a "simulate
+/// down" switch that makes it reject every `/receive` call so the
+/// ACK/failed tracking can be exercised without actually killing the
+/// container.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecondarySettings {
+    pub name: String,
+    pub delay_ms: u64,
+    pub failing: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BroadcastResult {
     pub message: String,

@@ -1,4 +1,4 @@
-import type { BroadcastResult, LogsResponse, SecondaryInfo } from './types'
+import type { BroadcastResult, LogsResponse, SecondaryInfo, SecondarySettings } from './types'
 
 const MASTER_URL = import.meta.env.VITE_MASTER_URL ?? 'http://localhost:3000'
 
@@ -23,4 +23,21 @@ export function postMessage(message: string): Promise<BroadcastResult> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message }),
   }).then((res) => json<BroadcastResult>(res))
+}
+
+export function fetchSecondarySettings(id: string): Promise<SecondarySettings> {
+  return fetch(`${MASTER_URL}/secondaries/${encodeURIComponent(id)}/settings`).then((res) =>
+    json<SecondarySettings>(res),
+  )
+}
+
+export function updateSecondarySettings(
+  id: string,
+  settings: SecondarySettings,
+): Promise<SecondarySettings> {
+  return fetch(`${MASTER_URL}/secondaries/${encodeURIComponent(id)}/settings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  }).then((res) => json<SecondarySettings>(res))
 }

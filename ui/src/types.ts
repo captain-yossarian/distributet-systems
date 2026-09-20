@@ -32,3 +32,9 @@ export interface LogsResponse {
   /** Ordered by registration order (oldest first). */
   secondaries: SecondaryLog[]
 }
+
+export interface SecondarySettings {
+  name: string
+  delay_ms: number
+  failing: boolean
+}
