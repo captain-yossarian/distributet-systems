@@ -10,7 +10,12 @@ Run everything with Docker Compose from the repo root:
 docker compose up --build
 ```
 
-This starts Redis, `master` (API on `http://localhost:3000`), one `secondary` replica, and the UI (`http://localhost:5173`). Open the UI to send messages, watch delivery logs, and add/stop/start secondaries — the "Add secondary" button needs master running as a container (it uses the Docker socket to spawn new ones), so prefer Compose over running `master` with `cargo run` if you want that to work. To start with more replicas, add `--scale secondary=3` (or similar) to the command above.
+This starts Redis, `master` (API on `http://localhost:3000`), and one `secondary` replica.
+
+Open the UI at **http://localhost:5173** to send messages, watch delivery logs, and add/stop/start secondaries.
+
+The "Add secondary" button needs master running as a container (it uses the Docker socket to spawn new ones), so prefer Compose over running `master` with `cargo run` if you want that to work.
+
+To start with more replicas, add `--scale secondary=3` (or similar) to the command above.
 
 For frontend-only development, run `cd ui && npm install && npm run dev` instead of building the UI's Docker image.
-
